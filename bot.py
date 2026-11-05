@@ -317,6 +317,32 @@ async def cmd_db(update, ctx):
     await update.message.reply_text(s)
 
 
+HELP_TEXT = """Life logger commands
+
+Answering pings
+(just type)  Reply to the oldest unanswered ping
+(reply to a ping)  Answer that specific ping
+skip  Skip the oldest unanswered ping (or the one you reply to)
+
+Manual entries
+now <text>  Spontaneous entry stamped with the current time
+@3:30pm <text>  Entry stamped with the most recent past occurrence of that clock time (am/pm optional)
+-1h30m <text>  Entry stamped that long ago (-45m, -2h also work)
+
+Commands
+/help  Show this list
+/status  Rate, window, pending and unanswered counts, pause state
+/rate [N]  Show or set pings per day (1-12); takes effect tomorrow
+/pause 4d | 12h | until nov 15  Stop sending pings for a while
+/resume  End the current pause early
+/db [N]  Row counts plus the last N pings and entries (default 5, max 20)
+/export  Send a copy of the SQLite database file"""
+
+
+async def cmd_help(update, ctx):
+    await update.message.reply_text(HELP_TEXT)
+
+
 async def cmd_export(update, ctx):
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "sampler-export.db")
@@ -332,7 +358,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     only_me = filters.Chat(chat_id=OWNER)  # everyone else is ignored silently
     for name, fn in [("pause", cmd_pause), ("resume", cmd_resume), ("rate", cmd_rate),
-                     ("status", cmd_status), ("db", cmd_db), ("export", cmd_export)]:
+                     ("status", cmd_status), ("db", cmd_db), ("export", cmd_export),
+                     ("help", cmd_help), ("start", cmd_help)]:
         app.add_handler(CommandHandler(name, fn, filters=only_me))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(tick, interval=60, first=1)
