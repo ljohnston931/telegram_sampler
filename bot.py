@@ -29,7 +29,7 @@ START_H = int(os.environ.get("WINDOW_START_HOUR", "8"))
 END_H = int(os.environ.get("WINDOW_END_HOUR", "2"))  # may be < START_H (crosses midnight)
 MIN_GAP = timedelta(hours=float(os.environ.get("MIN_GAP_HOURS", "1")))
 GRACE = timedelta(minutes=int(os.environ.get("LATE_GRACE_MIN", "15")))  # older than this -> 'missed', not sent late
-PROMPT = os.environ.get("PING_TEXT", "🔔 What are you doing / how's it going?")
+PROMPT = os.environ.get("PING_TEXT", "Sample please")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sampler")
