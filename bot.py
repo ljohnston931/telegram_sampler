@@ -1,0 +1,343 @@
+"""Random-sampling life logger: Telegram bot (MVP).
+
+Pings at random times; each reply is stored with the *ping's* timestamp.
+All times are stored as UTC ISO strings; TZ in config is for scheduling/display only.
+"""
+import logging
+import os
+import random
+import re
+import sqlite3
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from dateutil import parser as dparser
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+load_dotenv()
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER = int(os.environ["OWNER_CHAT_ID"])
+TZ = ZoneInfo(os.environ.get("TZ_NAME", "America/New_York"))
+DB_PATH = os.environ.get("DB_PATH", "sampler.db")
+DEFAULT_RATE = int(os.environ.get("PINGS_PER_DAY", "3"))
+START_H = int(os.environ.get("WINDOW_START_HOUR", "8"))
+END_H = int(os.environ.get("WINDOW_END_HOUR", "2"))  # may be < START_H (crosses midnight)
+MIN_GAP = timedelta(hours=float(os.environ.get("MIN_GAP_HOURS", "1")))
+GRACE = timedelta(minutes=int(os.environ.get("LATE_GRACE_MIN", "15")))  # older than this -> 'missed', not sent late
+PROMPT = os.environ.get("PING_TEXT", "🔔 What are you doing / how's it going?")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("sampler")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS pings(
+  id INTEGER PRIMARY KEY, scheduled_at TEXT NOT NULL, sent_at TEXT, telegram_msg_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|answered|skipped|missed|paused
+  silent INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS entries(
+  id INTEGER PRIMARY KEY, ping_id INTEGER REFERENCES pings(id), sampled_at TEXT NOT NULL,
+  entered_at TEXT NOT NULL, text TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'text',
+  mood INTEGER, energy INTEGER);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS settings_log(id INTEGER PRIMARY KEY, setting TEXT, value TEXT, effective_from TEXT);
+CREATE TABLE IF NOT EXISTS pauses(id INTEGER PRIMARY KEY, start TEXT NOT NULL, end TEXT NOT NULL);
+-- one row per sampling window: records the rate actually in effect that day
+CREATE TABLE IF NOT EXISTS day_plans(window_date TEXT PRIMARY KEY, n_pings INTEGER, window_start TEXT, window_end TEXT);
+"""
+
+
+@contextmanager
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
+
+
+def init_db():
+    with db() as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(SCHEMA)
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def parse(s):
+    return datetime.fromisoformat(s)
+
+
+def fmt_local(dt):
+    return dt.astimezone(TZ).strftime("%a %H:%M")
+
+
+def get_setting(key, default):
+    with db() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+# ---------------------------------------------------------------- scheduler
+
+def window(d):
+    """Sampling window for local date d: starts START_H on d, may run past midnight."""
+    start = datetime.combine(d, dtime(START_H), tzinfo=TZ).astimezone(timezone.utc)
+    hours = (END_H - START_H) % 24 or 24
+    return start, start + timedelta(hours=hours)
+
+
+def draw_times(lo, hi, n, min_gap):
+    span = (hi - lo).total_seconds()
+    gap = min(min_gap.total_seconds(), span / (2 * n)) if n else 0
+    for _ in range(1000):
+        ts = sorted(random.uniform(0, span) for _ in range(n))
+        if all(b - a >= gap for a, b in zip(ts, ts[1:])):
+            return [lo + timedelta(seconds=t) for t in ts]
+    seg = span / n  # fallback: one per equal stratum
+    return [lo + timedelta(seconds=i * seg + random.uniform(0, seg)) for i in range(n)]
+
+
+def ensure_plan(d, now):
+    """Generate the day's pings once. Idempotent via day_plans, so restarts keep the schedule."""
+    start, end = window(d)
+    with db() as c:
+        if c.execute("SELECT 1 FROM day_plans WHERE window_date=?", (d.isoformat(),)).fetchone():
+            return
+        rate = int(get_setting("pings_per_day", DEFAULT_RATE))
+        lo = max(start, now)
+        n = 0
+        if end > lo:
+            n = round(rate * (end - lo) / (end - start))  # partial window on first run
+            times = draw_times(lo, end, n, MIN_GAP) if n else []
+            c.executemany("INSERT INTO pings(scheduled_at) VALUES(?)", [(iso(t),) for t in times])
+        c.execute("INSERT INTO day_plans VALUES(?,?,?,?)", (d.isoformat(), n, iso(start), iso(end)))
+        log.info("plan %s: rate=%s generated=%s", d, rate, n)
+
+
+def is_paused(now):
+    with db() as c:
+        return c.execute("SELECT 1 FROM pauses WHERE start<=? AND end>?", (iso(now), iso(now))).fetchone() is not None
+
+
+async def tick(ctx: ContextTypes.DEFAULT_TYPE):
+    now = utcnow()
+    today = now.astimezone(TZ).date()
+    for d in (today - timedelta(days=1), today):
+        ensure_plan(d, now)
+    paused = is_paused(now)
+    with db() as c:
+        due = c.execute("SELECT * FROM pings WHERE status='pending' AND scheduled_at<=? ORDER BY scheduled_at",
+                        (iso(now),)).fetchall()
+    for p in due:
+        if now - parse(p["scheduled_at"]) > GRACE:
+            status = "missed"  # bot was down; don't send a stale ping
+        elif paused:
+            status = "paused"
+        else:
+            msg = await ctx.bot.send_message(OWNER, PROMPT)
+            with db() as c:
+                c.execute("UPDATE pings SET status='sent', sent_at=?, telegram_msg_id=? WHERE id=?",
+                          (iso(now), msg.message_id, p["id"]))
+            continue
+        with db() as c:
+            c.execute("UPDATE pings SET status=? WHERE id=?", (status, p["id"]))
+
+
+# ---------------------------------------------------------- entry handling
+
+NOW_RE = re.compile(r"^now\b[:,]?\s*(.+)$", re.I | re.S)
+AT_RE = re.compile(r"^@(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$", re.I | re.S)
+REL_RE = re.compile(r"^-(?:(\d+)h)?(?:(\d+)m)?\s+(.+)$", re.I | re.S)
+
+
+def parse_at(h, m, ampm, now):
+    """Most recent past occurrence of a local clock time. No am/pm -> try h and h+12."""
+    h, m = int(h), int(m or 0)
+    if ampm:
+        h = h % 12 + (12 if ampm.lower() == "pm" else 0)
+        hours = [h]
+    else:
+        hours = [h, h + 12] if h < 12 else [h]
+    local_now = now.astimezone(TZ)
+    best = None
+    for hh in hours:
+        if hh > 23 or m > 59:
+            return None
+        cand = datetime.combine(local_now.date(), dtime(hh, m), tzinfo=TZ)
+        if cand > local_now:
+            cand -= timedelta(days=1)
+        best = cand if best is None or cand > best else best
+    return best.astimezone(timezone.utc)
+
+
+def oldest_unanswered():
+    with db() as c:
+        return c.execute("SELECT * FROM pings WHERE status='sent' ORDER BY scheduled_at LIMIT 1").fetchone()
+
+
+def ping_by_msg(msg_id):
+    with db() as c:
+        return c.execute("SELECT * FROM pings WHERE telegram_msg_id=?", (msg_id,)).fetchone()
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    text = (m.text or "").strip()
+    now = utcnow()
+    replied = ping_by_msg(m.reply_to_message.message_id) if m.reply_to_message else None
+
+    # skip
+    if text.lower() == "skip":
+        p = replied or oldest_unanswered()
+        if not p:
+            return await m.reply_text("No unanswered ping to skip.")
+        with db() as c:
+            c.execute("UPDATE pings SET status='skipped' WHERE id=?", (p["id"],))
+        return await m.reply_text(f"Skipped ping from {fmt_local(parse(p['sent_at'] or p['scheduled_at']))}.")
+
+    ping, sampled, label = None, None, ""
+    if replied:
+        ping = replied
+    elif mt := NOW_RE.match(text):
+        text, sampled, label = mt.group(1).strip(), now, "spontaneous entry"
+    elif mt := AT_RE.match(text):
+        sampled = parse_at(mt.group(1), mt.group(2), mt.group(3), now)
+        if sampled is None:
+            return await m.reply_text("Couldn't parse that time.")
+        text, label = mt.group(4).strip(), "manual time"
+    elif (mt := REL_RE.match(text)) and (mt.group(1) or mt.group(2)):
+        sampled = now - timedelta(hours=int(mt.group(1) or 0), minutes=int(mt.group(2) or 0))
+        text, label = mt.group(3).strip(), "manual time"
+    else:
+        ping = oldest_unanswered()
+        if ping is None:
+            sampled, label = now, "no pending ping, logged as spontaneous"
+
+    if ping is not None:
+        sampled = parse(ping["sent_at"] or ping["scheduled_at"])
+        label = f"ping {fmt_local(sampled)}"
+
+    with db() as c:
+        c.execute("INSERT INTO entries(ping_id, sampled_at, entered_at, text, source) VALUES(?,?,?,?, 'text')",
+                  (ping["id"] if ping else None, iso(sampled), iso(now), text))
+        if ping:
+            c.execute("UPDATE pings SET status='answered' WHERE id=?", (ping["id"],))
+    await m.reply_text(f"✓ {label} → {fmt_local(sampled)}")
+
+
+# ----------------------------------------------------------------- commands
+
+def parse_pause(arg, now):
+    arg = arg.strip()
+    if mt := re.fullmatch(r"(\d+)\s*([dh])", arg, re.I):
+        n = int(mt.group(1))
+        return now + (timedelta(days=n) if mt.group(2).lower() == "d" else timedelta(hours=n))
+    if arg.lower().startswith("until"):
+        base = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt = dparser.parse(arg[5:], default=base)
+        dt = dt if dt.tzinfo else dt.replace(tzinfo=TZ)
+        if dt <= now:
+            dt = dt.replace(year=dt.year + 1)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+async def cmd_pause(update, ctx):
+    now = utcnow()
+    end = parse_pause(" ".join(ctx.args), now) if ctx.args else None
+    if not end:
+        return await update.message.reply_text("Usage: /pause 4d | /pause 12h | /pause until nov 15")
+    with db() as c:
+        c.execute("INSERT INTO pauses(start, end) VALUES(?,?)", (iso(now), iso(end)))
+    await update.message.reply_text(f"Paused until {end.astimezone(TZ).strftime('%a %b %d %H:%M')}.")
+
+
+async def cmd_resume(update, ctx):
+    now = utcnow()
+    with db() as c:
+        c.execute("UPDATE pauses SET end=? WHERE start<=? AND end>?", (iso(now), iso(now), iso(now)))
+    await update.message.reply_text("Resumed.")
+
+
+async def cmd_rate(update, ctx):
+    cur = int(get_setting("pings_per_day", DEFAULT_RATE))
+    if not ctx.args:
+        return await update.message.reply_text(f"{cur} pings/day.")
+    if not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= 12:
+        return await update.message.reply_text("Rate must be an integer 1-12.")
+    n = int(ctx.args[0])
+    eff = (utcnow().astimezone(TZ).date() + timedelta(days=1)).isoformat()
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO settings VALUES('pings_per_day', ?)", (str(n),))
+        c.execute("INSERT INTO settings_log(setting, value, effective_from) VALUES('pings_per_day', ?, ?)", (str(n), eff))
+    await update.message.reply_text(f"{n} pings/day, effective {eff}.")
+
+
+async def cmd_status(update, ctx):
+    now = utcnow()
+    with db() as c:
+        remaining = c.execute("SELECT COUNT(*) FROM pings WHERE status='pending'").fetchone()[0]
+        waiting = c.execute("SELECT COUNT(*) FROM pings WHERE status='sent'").fetchone()[0]
+        pause = c.execute("SELECT end FROM pauses WHERE start<=? AND end>?", (iso(now), iso(now))).fetchone()
+    s = f"Rate: {get_setting('pings_per_day', DEFAULT_RATE)}/day\nWindow: {START_H:02d}:00-{END_H:02d}:00 {TZ.key}\n"
+    s += f"Pending pings: {remaining}\nUnanswered: {waiting}\n"
+    s += f"Paused until {fmt_local(parse(pause['end']))}" if pause else "Not paused"
+    await update.message.reply_text(s)  # next ping time deliberately not shown (keeps sampling unpredictable)
+
+
+async def cmd_db(update, ctx):
+    """/db [N]: row counts per table plus the last N pings and entries (default 5, max 20)."""
+    n = min(int(ctx.args[0]), 20) if ctx.args and ctx.args[0].isdigit() else 5
+    with db() as c:
+        counts = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("pings", "entries", "pauses", "settings_log", "day_plans")}
+        by_status = c.execute("SELECT status, COUNT(*) k FROM pings GROUP BY status").fetchall()
+        pings = c.execute("SELECT * FROM pings ORDER BY scheduled_at DESC LIMIT ?", (n,)).fetchall()
+        entries = c.execute("SELECT * FROM entries ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    s = "Rows: " + ", ".join(f"{t} {k}" for t, k in counts.items()) + "\n"
+    s += "Ping status: " + (", ".join(f"{r['status']} {r['k']}" for r in by_status) or "none") + "\n"
+    s += f"\nLast {n} pings (scheduled / status):\n"
+    s += "\n".join(f"#{p['id']} {fmt_local(parse(p['scheduled_at']))} {p['status']}" for p in pings) or "none"
+    s += f"\n\nLast {n} entries (sampled / entered / ping):\n"
+    s += "\n".join(f"#{e['id']} {fmt_local(parse(e['sampled_at']))} / {fmt_local(parse(e['entered_at']))} "
+                   f"/ ping {e['ping_id'] or '-'}: {e['text'][:60]}" for e in entries) or "none"
+    await update.message.reply_text(s)
+
+
+async def cmd_export(update, ctx):
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "sampler-export.db")
+        src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(out)
+        src.backup(dst)
+        src.close(); dst.close()
+        with open(out, "rb") as f:
+            await update.message.reply_document(f, filename="sampler-export.db")
+
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    only_me = filters.Chat(chat_id=OWNER)  # everyone else is ignored silently
+    for name, fn in [("pause", cmd_pause), ("resume", cmd_resume), ("rate", cmd_rate),
+                     ("status", cmd_status), ("db", cmd_db), ("export", cmd_export)]:
+        app.add_handler(CommandHandler(name, fn, filters=only_me))
+    app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
+    app.job_queue.run_repeating(tick, interval=60, first=1)
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
