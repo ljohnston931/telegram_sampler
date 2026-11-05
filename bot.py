@@ -206,36 +206,37 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await m.reply_text("No unanswered ping to skip.")
         with db() as c:
             c.execute("UPDATE pings SET status='skipped' WHERE id=?", (p["id"],))
-        return await m.reply_text(f"Skipped ping from {fmt_local(parse(p['sent_at'] or p['scheduled_at']))}.")
+        return  # success: stay quiet
 
-    ping, sampled, label = None, None, ""
+    ping, sampled, notice = None, None, None
     if replied:
         ping = replied
     elif mt := NOW_RE.match(text):
-        text, sampled, label = mt.group(1).strip(), now, "spontaneous entry"
+        text, sampled = mt.group(1).strip(), now
     elif mt := AT_RE.match(text):
         sampled = parse_at(mt.group(1), mt.group(2), mt.group(3), now)
         if sampled is None:
             return await m.reply_text("Couldn't parse that time.")
-        text, label = mt.group(4).strip(), "manual time"
+        text = mt.group(4).strip()
     elif (mt := REL_RE.match(text)) and (mt.group(1) or mt.group(2)):
         sampled = now - timedelta(hours=int(mt.group(1) or 0), minutes=int(mt.group(2) or 0))
-        text, label = mt.group(3).strip(), "manual time"
+        text = mt.group(3).strip()
     else:
         ping = oldest_unanswered()
         if ping is None:
-            sampled, label = now, "no pending ping, logged as spontaneous"
+            sampled = now
+            notice = f"No pending ping, logged as spontaneous entry at {fmt_local(sampled)}."
 
     if ping is not None:
         sampled = parse(ping["sent_at"] or ping["scheduled_at"])
-        label = f"ping {fmt_local(sampled)}"
 
     with db() as c:
         c.execute("INSERT INTO entries(ping_id, sampled_at, entered_at, text, source) VALUES(?,?,?,?, 'text')",
                   (ping["id"] if ping else None, iso(sampled), iso(now), text))
         if ping:
             c.execute("UPDATE pings SET status='answered' WHERE id=?", (ping["id"],))
-    await m.reply_text(f"✓ {label} → {fmt_local(sampled)}")
+    if notice:  # only the unexpected path gets a reply; normal successes are silent
+        await m.reply_text(notice)
 
 
 # ----------------------------------------------------------------- commands
