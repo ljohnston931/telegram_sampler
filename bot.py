@@ -355,6 +355,7 @@ async def cmd_export(update, ctx):
 
 
 def main():
+    log.info("database file: %s", os.path.abspath(DB_PATH))
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     only_me = filters.Chat(chat_id=OWNER)  # everyone else is ignored silently

@@ -136,10 +136,10 @@ Save with Ctrl+O, Enter, then exit with Ctrl+X. The `.env` file holds secrets an
 
 ```bash
 docker build -t telegram_sampler .
-sudo mkdir -p /opt/telegram_sampler-data
-sudo chown $USER:$USER /opt/telegram_sampler-data
+sudo mkdir -p /opt/sampler-data
+sudo chown $USER:$USER /opt/sampler-data
 docker run -d --name telegram_sampler --restart unless-stopped \
-  --env-file .env -v /opt/telegram_sampler-data:/data:Z telegram_sampler
+  --env-file .env -v /opt/sampler-data:/data:Z telegram_sampler
 ```
 
 - `--restart unless-stopped` brings the bot back after a crash or reboot.
@@ -174,14 +174,14 @@ sudo systemctl enable --now crond
 Open the crontab with `crontab -e` and add this line (runs daily at 4:00 AM server time):
 
 ```
-0 4 * * * sqlite3 /opt/telegram_sampler-data/sampler.db ".backup '/opt/telegram_sampler-data/backup.db'"
+0 4 * * * sqlite3 /opt/sampler-data/sampler.db ".backup '/opt/sampler-data/backup.db'"
 ```
 
 **On your computer**, pull the backup:
 
 ```bash
 mkdir -p ~/backups
-rsync -a -e "ssh -i ~/.ssh/oracle.key" <SSH_USER>@<SERVER_IP>:/opt/telegram_sampler-data/backup.db ~/backups/
+rsync -a -e "ssh -i ~/.ssh/oracle.key" <SSH_USER>@<SERVER_IP>:/opt/sampler-data/backup.db ~/backups/
 ```
 
 Run this by hand every so often, or automate it with a `launchd` (macOS) or `cron` entry on your computer.
@@ -196,10 +196,10 @@ git pull
 docker build -t telegram_sampler .
 docker rm -f telegram_sampler
 docker run -d --name telegram_sampler --restart unless-stopped \
-  --env-file .env -v /opt/telegram_sampler-data:/data:Z telegram_sampler
+  --env-file .env -v /opt/sampler-data:/data:Z telegram_sampler
 ```
 
-The data in `/opt/telegram_sampler-data` persists across updates.
+The data in `/opt/sampler-data` persists across updates.
 
 ## Keeping the free instance alive
 
@@ -218,7 +218,7 @@ Oracle can reclaim idle Always Free instances. Upgrading the account to **Pay As
 | `Permission denied (publickey)` | Check the user (`ubuntu` vs `opc`) and that you pass `-i ~/.ssh/oracle.key`. |
 | `WARNING: UNPROTECTED PRIVATE KEY FILE` | Run `chmod 600 ~/.ssh/oracle.key`. |
 | `docker: permission denied` | You skipped the `exit` and re-login after `usermod -aG docker`. |
-| Database "permission denied" errors | Make sure the `:Z` flag is on the volume mount and `/opt/telegram_sampler-data` is owned by your user. |
+| Database "permission denied" errors | Make sure the `:Z` flag is on the volume mount and `/opt/sampler-data` is owned by your user. |
 | `Out of capacity` creating an A1 instance | Retry later, or use the `E2.1.Micro` shape. |
 
 ## Behavior
