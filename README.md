@@ -240,7 +240,6 @@ You don't need any of this to run the bot on the server. It's for working on the
 ### Requirements files
 
 - `requirements.txt` lists what the bot needs to run. This is what the Docker image installs.
-- `requirements-dev.txt` includes everything in `requirements.txt` (via `-r requirements.txt`) and adds `pytest`.
 
 ### Python version
 
@@ -259,7 +258,7 @@ From the project folder, create a virtual environment and install the dev requir
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 ```
 
 Run `source .venv/bin/activate` again in each new terminal before running tests. You'll know it's active when your prompt starts with `(.venv)`. Run `deactivate` to leave it.
