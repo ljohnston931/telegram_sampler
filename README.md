@@ -191,14 +191,16 @@ Run this by hand every so often, or automate it with a `launchd` (macOS) or `cro
 ## 12. Updating later
 
 On the server:
+The repository includes a `deploy.sh` script that pulls the latest code, builds the Docker image, runs the tests, and deploys if they pass.
 
+Make it executable once:
 ```bash
-cd ~/telegram_sampler
-git pull
-docker build -t telegram_sampler .
-docker rm -f telegram_sampler
-docker run -d --name telegram_sampler --restart unless-stopped \
-  --env-file .env -v /opt/sampler-data:/data:Z telegram_sampler
+chmod +x deploy.sh
+```
+
+Then run to deploy updates:
+```bash
+./deploy.sh
 ```
 
 The data in `/opt/sampler-data` persists across updates, and the database is upgraded automatically on startup.
