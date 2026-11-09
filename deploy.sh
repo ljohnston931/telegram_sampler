@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 set -e
 
@@ -21,4 +20,3 @@ docker run -d --name telegram_sampler --restart unless-stopped \
   --env-file .env -v /opt/sampler-data:/data:Z telegram_sampler
 
 echo "==> Deployment complete!"
-```
