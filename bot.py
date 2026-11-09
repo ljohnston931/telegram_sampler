@@ -5,7 +5,6 @@ All times are stored as UTC ISO strings; TZ in config is for scheduling/display 
 """
 import logging
 import os
-import random
 import re
 import sqlite3
 import tempfile
@@ -17,6 +16,8 @@ from dateutil import parser as dparser
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from sampling import plan_day
 
 load_dotenv()
 
@@ -99,17 +100,6 @@ def window(d):
     return start, start + timedelta(hours=hours)
 
 
-def draw_times(lo, hi, n, min_gap):
-    span = (hi - lo).total_seconds()
-    gap = min(min_gap.total_seconds(), span / (2 * n)) if n else 0
-    for _ in range(1000):
-        ts = sorted(random.uniform(0, span) for _ in range(n))
-        if all(b - a >= gap for a, b in zip(ts, ts[1:])):
-            return [lo + timedelta(seconds=t) for t in ts]
-    seg = span / n  # fallback: one per equal stratum
-    return [lo + timedelta(seconds=i * seg + random.uniform(0, seg)) for i in range(n)]
-
-
 def ensure_plan(d, now):
     """Generate the day's pings once. Idempotent via day_plans, so restarts keep the schedule."""
     start, end = window(d)
@@ -117,14 +107,10 @@ def ensure_plan(d, now):
         if c.execute("SELECT 1 FROM day_plans WHERE window_date=?", (d.isoformat(),)).fetchone():
             return
         rate = int(get_setting("pings_per_day", DEFAULT_RATE))
-        lo = max(start, now)
-        n = 0
-        if end > lo:
-            n = round(rate * (end - lo) / (end - start))  # partial window on first run
-            times = draw_times(lo, end, n, MIN_GAP) if n else []
-            c.executemany("INSERT INTO pings(scheduled_at) VALUES(?)", [(iso(t),) for t in times])
-        c.execute("INSERT INTO day_plans VALUES(?,?,?,?)", (d.isoformat(), n, iso(start), iso(end)))
-        log.info("plan %s: rate=%s generated=%s", d, rate, n)
+        times = plan_day(rate, start, end, now, MIN_GAP)
+        c.executemany("INSERT INTO pings(scheduled_at) VALUES(?)", [(iso(t),) for t in times])
+        c.execute("INSERT INTO day_plans VALUES(?,?,?,?)", (d.isoformat(), len(times), iso(start), iso(end)))
+        log.info("plan %s: rate=%s generated=%s", d, rate, len(times))
 
 
 def is_paused(now):
