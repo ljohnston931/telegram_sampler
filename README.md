@@ -231,6 +231,64 @@ Send `/help` to the bot for the full list with accepted values. The main ones:
 | Database "permission denied" errors | Make sure the `:Z` flag is on the volume mount and `/opt/sampler-data` is owned by your user. |
 | `Out of capacity` creating an A1 instance | Retry later, or use the `E2.1.Micro` shape. |
 
+## Development and tests
+
+You don't need any of this to run the bot on the server. It's for working on the code on your own computer.
+
+### Requirements files
+
+- `requirements.txt` lists what the bot needs to run. This is what the Docker image installs.
+- `requirements-dev.txt` includes everything in `requirements.txt` (via `-r requirements.txt`) and adds `pytest`.
+
+### Python version
+
+You need Python 3.9 or newer (the bot uses `zoneinfo`, which was added in 3.9). Check with:
+
+```bash
+python --version
+```
+
+If you manage Python versions with pyenv, you can pin the project to one with `pyenv local 3.9.1` (or a newer version).
+
+### One-time setup
+
+From the project folder, create a virtual environment and install the dev requirements into it:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+```
+
+Run `source .venv/bin/activate` again in each new terminal before running tests. You'll know it's active when your prompt starts with `(.venv)`. Run `deactivate` to leave it.
+
+On Windows, activate with `.venv\Scripts\activate` instead, and also run `python -m pip install tzdata`, because Windows has no built-in timezone database.
+
+### Running the tests
+
+```bash
+python -m pytest -q
+```
+
+Useful variations:
+
+```bash
+python -m pytest                              # verbose-ish output
+python -m pytest test_bot.py                  # one file
+python -m pytest -k "parse_at"                # only tests whose name matches
+python -m pytest test_bot.py::TestTick        # one test class
+python -m pytest -x                           # stop at the first failure
+```
+
+Use `python -m pytest` rather than plain `pytest`. With pyenv or several Pythons installed, plain `pytest` can run under a different Python than `python` does, which causes confusing "module not found" errors.
+
+The tests don't need a `.env` file, a Telegram connection, or your real database. Each test uses a temporary SQLite file, and Telegram messages are faked.
+
+### What's tested
+
+- `test_sampling.py`: the ping-count and timing logic in `sampling.py`.
+- `test_bot.py`: everything in `bot.py` except the Telegram startup code in `main()`: time parsing, scheduling, entry handling, the commands, and the database migration.
+
 ## Behavior
 
 **Schedule.** Each day has a sampling window (default 08:00 to 02:00 local time, so it runs past midnight). The day's plan is made once, at the start of that day's date, and survives restarts.
