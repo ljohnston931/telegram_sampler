@@ -132,6 +132,8 @@ OWNER_CHAT_ID=<numeric ID from @userinfobot>
 
 Save with Ctrl+O, Enter, then exit with Ctrl+X. The `.env` file holds secrets and is not committed to git.
 
+The other settings in `.env.example` are optional. `PINGS_MEAN`, `PINGS_MIN` and `PINGS_MAX` are only starting values: once you use `/mean`, `/min` or `/max` in Telegram, the stored values take over (see [Behavior](#behavior)).
+
 ## 9. Build and run
 
 ```bash
@@ -199,7 +201,7 @@ docker run -d --name telegram_sampler --restart unless-stopped \
   --env-file .env -v /opt/sampler-data:/data:Z telegram_sampler
 ```
 
-The data in `/opt/sampler-data` persists across updates.
+The data in `/opt/sampler-data` persists across updates, and the database is upgraded automatically on startup.
 
 ## Keeping the free instance alive
 
@@ -207,9 +209,17 @@ Oracle can reclaim idle Always Free instances. Upgrading the account to **Pay As
 
 ## Bot commands
 
-- `/status`: show the bot's current state
-- `/db`: show database info
-- `/export`: send you an export of your data
+Send `/help` to the bot for the full list with accepted values. The main ones:
+
+- `/status`: show the mean, min, max, window, and pending and unanswered pings
+- `/mean [X]`: show or set the Poisson mean pings per day (0.1 to 50, decimals ok)
+- `/min [N]`: show or set the fewest pings a day can have (0 to 100, or `none`)
+- `/max [N]`: show or set the most pings a day can have (1 to 100, or `none`)
+- `/pause 4d | 12h | until nov 15` and `/resume`: stop and restart pings
+- `/db [N]`: show database info and the last N pings and entries
+- `/export`: send you a copy of the database
+
+`/mean`, `/min` and `/max` take effect from the next day's plan.
 
 ## Troubleshooting
 
@@ -223,4 +233,14 @@ Oracle can reclaim idle Always Free instances. Upgrading the account to **Pay As
 
 ## Behavior
 
-_TODO: describe how the sampling works (schedule, ping format, what gets logged)._
+**Schedule.** Each day has a sampling window (default 08:00 to 02:00 local time, so it runs past midnight). The day's plan is made once, at the start of that day's date, and survives restarts.
+
+**How many pings.** Each day's count is drawn from a Poisson distribution with the mean you set, then the pings are placed uniformly at random in the window. With no min or max this is a true Poisson process: the pings you've had so far tell you nothing about how many are still to come, and a day can have zero pings.
+
+**Min and max.** If you set a min and/or max, the count is drawn from the Poisson distribution restricted to that range, which is the same as redrawing any day that falls outside it. Set both to `none` to let it run free. Bounds reintroduce a small amount of predictability (with a max of 6, you know a day is done after the sixth ping), so wider bounds leak less. Pings can land close together; there is no minimum gap.
+
+**Partial first day.** If the bot starts partway through a window, the mean is scaled by the fraction of the window left, and min and max are not applied to that partial day.
+
+**Replying.** Just type to answer the oldest unanswered ping, or reply to a specific ping. The entry is stored with the ping's time, not the time you replied. `skip` skips a ping. `now <text>`, `@3:30pm <text>` and `-1h30m <text>` log entries that aren't tied to a ping. A ping that is more than `LATE_GRACE_MIN` minutes overdue (for example, the bot was down) is marked missed instead of being sent late.
+
+**What's recorded.** Each day's row in `day_plans` stores the number of pings and the distribution it was drawn from (mean, min, max), so you can account for truncation when analyzing the data. Changes to settings are logged in `settings_log`. All times are stored in UTC.

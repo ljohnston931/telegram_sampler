@@ -25,10 +25,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER = int(os.environ["OWNER_CHAT_ID"])
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "America/New_York"))
 DB_PATH = os.environ.get("DB_PATH", "sampler.db")
-DEFAULT_RATE = int(os.environ.get("PINGS_PER_DAY", "3"))
+DEFAULT_MEAN = os.environ.get("PINGS_MEAN", os.environ.get("PINGS_PER_DAY", "3"))  # Poisson mean pings/day
+DEFAULT_MIN = os.environ.get("PINGS_MIN", "none")  # whole number, or "none" for no lower bound
+DEFAULT_MAX = os.environ.get("PINGS_MAX", "none")  # whole number, or "none" for no upper bound
 START_H = int(os.environ.get("WINDOW_START_HOUR", "8"))
 END_H = int(os.environ.get("WINDOW_END_HOUR", "2"))  # may be < START_H (crosses midnight)
-MIN_GAP = timedelta(hours=float(os.environ.get("MIN_GAP_HOURS", "1")))
 GRACE = timedelta(minutes=int(os.environ.get("LATE_GRACE_MIN", "15")))  # older than this -> 'missed', not sent late
 PROMPT = os.environ.get("PING_TEXT", "Sample please")
 
@@ -47,8 +48,11 @@ CREATE TABLE IF NOT EXISTS entries(
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS settings_log(id INTEGER PRIMARY KEY, setting TEXT, value TEXT, effective_from TEXT);
 CREATE TABLE IF NOT EXISTS pauses(id INTEGER PRIMARY KEY, start TEXT NOT NULL, end TEXT NOT NULL);
--- one row per sampling window: records the rate actually in effect that day
-CREATE TABLE IF NOT EXISTS day_plans(window_date TEXT PRIMARY KEY, n_pings INTEGER, window_start TEXT, window_end TEXT);
+-- one row per sampling window: the distribution the count was drawn from, and the count itself.
+-- mean is the Poisson mean actually used (scaled down for a partial window); min_n/max_n are NULL
+-- when unbounded or not applied. Rows from before the Poisson change have NULL mean/min_n/max_n.
+CREATE TABLE IF NOT EXISTS day_plans(window_date TEXT PRIMARY KEY, n_pings INTEGER, window_start TEXT, window_end TEXT,
+  mean REAL, min_n INTEGER, max_n INTEGER);
 """
 
 
@@ -67,6 +71,11 @@ def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        # migrate a day_plans table created before the Poisson change
+        have = {r["name"] for r in c.execute("PRAGMA table_info(day_plans)")}
+        for col, typ in (("mean", "REAL"), ("min_n", "INTEGER"), ("max_n", "INTEGER")):
+            if col not in have:
+                c.execute(f"ALTER TABLE day_plans ADD COLUMN {col} {typ}")
 
 
 def utcnow():
@@ -91,6 +100,22 @@ def get_setting(key, default):
     return r["value"] if r else default
 
 
+MEAN_MIN, MEAN_MAX = 0.1, 50.0  # accepted range for /mean
+BOUND_MAX = 100                 # largest accepted value for /min and /max
+
+
+def to_bound(s):
+    """Stored/env text -> int, or None for 'none'."""
+    s = str(s).strip().lower()
+    return None if s in ("", "none") else int(s)
+
+
+def get_params():
+    """Current (mean, min_n, max_n). Falls back to the old pings_per_day setting if /mean was never used."""
+    mean = float(get_setting("mean", get_setting("pings_per_day", DEFAULT_MEAN)))
+    return mean, to_bound(get_setting("min_n", DEFAULT_MIN)), to_bound(get_setting("max_n", DEFAULT_MAX))
+
+
 # ---------------------------------------------------------------- scheduler
 
 def window(d):
@@ -106,11 +131,13 @@ def ensure_plan(d, now):
     with db() as c:
         if c.execute("SELECT 1 FROM day_plans WHERE window_date=?", (d.isoformat(),)).fetchone():
             return
-        rate = int(get_setting("pings_per_day", DEFAULT_RATE))
-        times = plan_day(rate, start, end, now, MIN_GAP)
-        c.executemany("INSERT INTO pings(scheduled_at) VALUES(?)", [(iso(t),) for t in times])
-        c.execute("INSERT INTO day_plans VALUES(?,?,?,?)", (d.isoformat(), len(times), iso(start), iso(end)))
-        log.info("plan %s: rate=%s generated=%s", d, rate, len(times))
+        plan = plan_day(*get_params(), start, end, now)
+        c.executemany("INSERT INTO pings(scheduled_at) VALUES(?)", [(iso(t),) for t in plan.times])
+        c.execute("INSERT INTO day_plans(window_date, n_pings, window_start, window_end, mean, min_n, max_n) "
+                  "VALUES(?,?,?,?,?,?,?)",
+                  (d.isoformat(), len(plan.times), iso(start), iso(end), plan.mean, plan.min_n, plan.max_n))
+        log.info("plan %s: mean=%.3g min=%s max=%s generated=%s",
+                 d, plan.mean, plan.min_n, plan.max_n, len(plan.times))
 
 
 def is_paused(now):
@@ -259,18 +286,66 @@ async def cmd_resume(update, ctx):
     await update.message.reply_text("Resumed.")
 
 
-async def cmd_rate(update, ctx):
-    cur = int(get_setting("pings_per_day", DEFAULT_RATE))
-    if not ctx.args:
-        return await update.message.reply_text(f"{cur} pings/day.")
-    if not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= 12:
-        return await update.message.reply_text("Rate must be an integer 1-12.")
-    n = int(ctx.args[0])
+def save_setting(key, value):
+    """Store a setting and log it. Returns the local date it takes effect (tomorrow's plan onward)."""
     eff = (utcnow().astimezone(TZ).date() + timedelta(days=1)).isoformat()
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO settings VALUES('pings_per_day', ?)", (str(n),))
-        c.execute("INSERT INTO settings_log(setting, value, effective_from) VALUES('pings_per_day', ?, ?)", (str(n), eff))
-    await update.message.reply_text(f"{n} pings/day, effective {eff}.")
+        c.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (key, value))
+        c.execute("INSERT INTO settings_log(setting, value, effective_from) VALUES(?, ?, ?)", (key, value, eff))
+    return eff
+
+
+def parse_bound_arg(arg, lowest):
+    """'none' -> (True, None); whole number lowest..BOUND_MAX -> (True, n); anything else -> (False, None)."""
+    if arg.lower() == "none":
+        return True, None
+    if arg.isdigit() and lowest <= int(arg) <= BOUND_MAX:
+        return True, int(arg)
+    return False, None
+
+
+def show(v):
+    return "none" if v is None else f"{v:g}" if isinstance(v, float) else str(v)
+
+
+async def cmd_mean(update, ctx):
+    mean, _, _ = get_params()
+    if not ctx.args:
+        return await update.message.reply_text(f"Mean: {mean:g} pings/day.")
+    try:
+        x = float(ctx.args[0])
+    except ValueError:
+        x = float("nan")
+    if not MEAN_MIN <= x <= MEAN_MAX:  # also rejects nan
+        return await update.message.reply_text(f"Mean must be a number from {MEAN_MIN:g} to {MEAN_MAX:g}.")
+    eff = save_setting("mean", str(x))
+    await update.message.reply_text(f"Mean {x:g} pings/day, effective {eff}.")
+
+
+async def cmd_min(update, ctx):
+    _, lo, hi = get_params()
+    if not ctx.args:
+        return await update.message.reply_text(f"Min: {show(lo)} pings/day.")
+    ok, n = parse_bound_arg(ctx.args[0], 0)
+    if not ok:
+        return await update.message.reply_text(f"Min must be a whole number from 0 to {BOUND_MAX}, or none.")
+    if n is not None and hi is not None and n > hi:
+        return await update.message.reply_text(f"Min can't be above the current max ({hi}). Change max first.")
+    eff = save_setting("min_n", show(n))
+    await update.message.reply_text(f"Min {show(n)}, effective {eff}.")
+
+
+async def cmd_max(update, ctx):
+    _, lo, hi = get_params()
+    if not ctx.args:
+        return await update.message.reply_text(f"Max: {show(hi)} pings/day.")
+    ok, n = parse_bound_arg(ctx.args[0], 1)
+    if not ok:
+        return await update.message.reply_text(f"Max must be a whole number from 1 to {BOUND_MAX}, or none.")
+    if n is not None and lo is not None and n < lo:
+        return await update.message.reply_text(f"Max can't be below the current min ({lo}). Change min first.")
+    eff = save_setting("max_n", show(n))
+    await update.message.reply_text(f"Max {show(n)}, effective {eff}.")
 
 
 async def cmd_status(update, ctx):
@@ -279,7 +354,8 @@ async def cmd_status(update, ctx):
         remaining = c.execute("SELECT COUNT(*) FROM pings WHERE status='pending'").fetchone()[0]
         waiting = c.execute("SELECT COUNT(*) FROM pings WHERE status='sent'").fetchone()[0]
         pause = c.execute("SELECT end FROM pauses WHERE start<=? AND end>?", (iso(now), iso(now))).fetchone()
-    s = f"Rate: {get_setting('pings_per_day', DEFAULT_RATE)}/day\nWindow: {START_H:02d}:00-{END_H:02d}:00 {TZ.key}\n"
+    mean, lo, hi = get_params()
+    s = f"Mean: {mean:g} pings/day (min {show(lo)}, max {show(hi)})\nWindow: {START_H:02d}:00-{END_H:02d}:00 {TZ.key}\n"
     s += f"Pending pings: {remaining}\nUnanswered: {waiting}\n"
     s += f"Paused until {fmt_local(parse(pause['end']))}" if pause else "Not paused"
     await update.message.reply_text(s)  # next ping time deliberately not shown (keeps sampling unpredictable)
@@ -304,7 +380,7 @@ async def cmd_db(update, ctx):
     await update.message.reply_text(s)
 
 
-HELP_TEXT = """Life logger commands
+HELP_TEXT = f"""Life logger commands
 
 Answering pings
 (just type)  Reply to the oldest unanswered ping
@@ -318,8 +394,11 @@ now <text>  Spontaneous entry stamped with the current time
 
 Commands
 /help  Show this list
-/status  Rate, window, pending and unanswered counts, pause state
-/rate [N]  Show or set pings per day (1-12); takes effect tomorrow
+/status  Mean, min, max, window, pending and unanswered counts, pause state
+/mean [X]  Show or set the Poisson mean pings per day: a number {MEAN_MIN:g}-{MEAN_MAX:g}, decimals ok (e.g. 2.5)
+/min [N]  Show or set the fewest pings a day can have: whole number 0-{BOUND_MAX}, or none
+/max [N]  Show or set the most pings a day can have: whole number 1-{BOUND_MAX}, or none
+          (min can't exceed max; none = no limit; mean/min/max take effect tomorrow)
 /pause 4d | 12h | until nov 15  Stop sending pings for a while
 /resume  End the current pause early
 /db [N]  Row counts plus the last N pings and entries (default 5, max 20)
@@ -345,7 +424,8 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     only_me = filters.Chat(chat_id=OWNER)  # everyone else is ignored silently
-    for name, fn in [("pause", cmd_pause), ("resume", cmd_resume), ("rate", cmd_rate),
+    for name, fn in [("pause", cmd_pause), ("resume", cmd_resume), ("mean", cmd_mean),
+                     ("min", cmd_min), ("max", cmd_max),
                      ("status", cmd_status), ("db", cmd_db), ("export", cmd_export),
                      ("help", cmd_help), ("start", cmd_help)]:
         app.add_handler(CommandHandler(name, fn, filters=only_me))
